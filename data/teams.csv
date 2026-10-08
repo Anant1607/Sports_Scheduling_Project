@@ -1,1 +1,9 @@
-
+TeamID,TeamName,Region,Group,IsPopular,IsStrong,IsTourist,IsWeak,RivalTeamID
+T1,North Valley FC,North,1,0,1,0,0,None
+T2,Riverfront Athletic,North,2,0,0,1,0,None
+T3,Metro United,Center,1,1,1,0,0,T4
+T4,Capital City FC,Center,2,1,1,1,0,T3
+T5,Central Lions,Center,1,0,0,0,1,None
+T6,Metro Rovers,Center,2,0,0,0,0,None
+T7,Southern Stars,South,1,0,0,1,0,None
+T8,Coastal Town FC,South,2,0,0,0,1,None
