@@ -29,7 +29,7 @@ def test_no_double_booking(schedule_df):
     """
     for round_num, group in schedule_df.groupby('Round'):
         # Combine Home and Away teams into a single list for this round
-        teams_in_round = group['Home_Team'].tolist() + group['Away_Team'].tolist()
+        teams_in_round = group['Home'].tolist() + group['Away'].tolist()
         
         # Filter out the "Idle" or "Bye" placeholders
         teams_in_round = [t for t in teams_in_round if 'Idle' not in str(t) and 'Bye' not in str(t)]
@@ -46,8 +46,8 @@ def test_total_matches_per_team(schedule_df):
     Ensures every real team plays a perfect single round-robin (7 total matches).
     """
     # Filter out bye weeks
-    valid_home = schedule_df[~schedule_df['Home_Team'].str.contains('Idle|Bye', na=False)]['Home_Team']
-    valid_away = schedule_df[~schedule_df['Away_Team'].str.contains('Idle|Bye', na=False)]['Away_Team']
+    valid_home = schedule_df[~schedule_df['Home'].str.contains('Idle|Bye', na=False)]['Home']
+    valid_away = schedule_df[~schedule_df['Away'].str.contains('Idle|Bye', na=False)]['Away']
     
     # Count total appearances across both columns
     team_match_counts = pd.concat([valid_home, valid_away]).value_counts()
@@ -60,19 +60,19 @@ def test_home_away_sequence(schedule_df):
     Ensures no team plays 3 consecutive home games or 3 consecutive away games.
     """
     # Extract a list of all unique real teams
-    all_teams = set(schedule_df['Home_Team']).union(set(schedule_df['Away_Team']))
+    all_teams = set(schedule_df['Home']).union(set(schedule_df['Away']))
     real_teams = {t for t in all_teams if 'Idle' not in str(t) and 'Bye' not in str(t)}
 
     for team in real_teams:
         # Isolate matches for this specific team and sort them chronologically
         team_matches = schedule_df[
-            (schedule_df['Home_Team'] == team) | (schedule_df['Away_Team'] == team)
+            (schedule_df['Home'] == team) | (schedule_df['Away'] == team)
         ].sort_values('Round')
         
         # Build a sequence string (e.g., 'HHAHAA')
         sequence = []
         for _, row in team_matches.iterrows():
-            if row['Home_Team'] == team:
+            if row['Home'] == team:
                 sequence.append('H')
             else:
                 sequence.append('A')
