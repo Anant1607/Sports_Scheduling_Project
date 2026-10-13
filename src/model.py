@@ -169,17 +169,17 @@ def build_model(df: pd.DataFrame):
     # Prevents 3 consecutive away games.
     # ------------------------------------------------------------
     #
-    # for i in teams:
-    #     for k in range(1, 6):
-    #         prob += (
-    #             pulp.lpSum(
-    #                 x[j][i][r]
-    #                 for j in teams
-    #                 if j != i
-    #                 for r in range(k, k + 3)
-    #             ) <= 2,
-    #             f"NoThreeConsecutiveAway_{i}_{k}"
-    #         )
+    for i in teams:
+        for k in range(1, 6):
+            prob += (
+                pulp.lpSum(
+                    x[j][i][r]
+                    for j in teams
+                    if j != i
+                    for r in range(k, k + 3)
+                ) <= 2,
+                f"NoThreeConsecutiveAway_{i}_{k}"
+            )
 
 
     # ------------------------------------------------------------
@@ -188,26 +188,26 @@ def build_model(df: pd.DataFrame):
     # Each team must play exactly 2 opponents from its own group.
     # ------------------------------------------------------------
     #
-    # for i in teams:
-    #     team_group = df.loc[
-    #         df["TeamID"] == i, "Group"
-    #     ].iloc[0]
-    #
-    #     same_group_teams = (
-    #         group_1_teams
-    #         if team_group == 1
-    #         else group_2_teams
-    #     )
-    #
-    #     prob += (
-    #         pulp.lpSum(
-    #             x[i][j][k] + x[j][i][k]
-    #             for j in same_group_teams
-    #             if j != i
-    #             for k in rounds
-    #         ) == 2,
-    #         f"GroupFairness_{i}"
-    #     )
+    for i in teams:
+        team_group = df.loc[
+            df["TeamID"] == i, "Group"
+        ].iloc[0]
+    
+        same_group_teams = (
+            group_1_teams
+            if team_group == 1
+            else group_2_teams
+        )
+    
+        prob += (
+            pulp.lpSum(
+                x[i][j][k] + x[j][i][k]
+                for j in same_group_teams
+                if j != i
+                for k in rounds
+            ) == 2,
+            f"GroupFairness_{i}"
+        )
 
 
     # ------------------------------------------------------------
