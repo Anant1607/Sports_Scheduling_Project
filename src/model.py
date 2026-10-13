@@ -150,17 +150,17 @@ def build_model(df: pd.DataFrame):
     # Prevents 3 consecutive home games.
     # ------------------------------------------------------------
     #
-    # for i in teams:
-    #     for k in range(1, 6):
-    #         prob += (
-    #             pulp.lpSum(
-    #                 x[i][j][r]
-    #                 for j in teams
-    #                 if j != i
-    #                 for r in range(k, k + 3)
-    #             ) <= 2,
-    #             f"NoThreeConsecutiveHome_{i}_{k}"
-    #         )
+    for i in teams:
+        for k in range(1, 6):
+            prob += (
+                pulp.lpSum(
+                    x[i][j][r]
+                    for j in teams
+                    if j != i
+                    for r in range(k, k + 3)
+                ) <= 2,
+                f"NoThreeConsecutiveHome_{i}_{k}"
+            )
 
 
     # ------------------------------------------------------------
