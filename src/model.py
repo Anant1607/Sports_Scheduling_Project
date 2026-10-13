@@ -217,25 +217,25 @@ def build_model(df: pd.DataFrame):
     # it cannot play AWAY against a South team again in round k+1.
     # ------------------------------------------------------------
     #
-    # for i in north_teams:
-    #     for k in range(1, 7):
-    #
-    #         current_round_south_away = pulp.lpSum(
-    #             x[j][i][k]
-    #             for j in south_teams
-    #         )
-    #
-    #         next_round_south_away = pulp.lpSum(
-    #             x[j][i][k + 1]
-    #             for j in south_teams
-    #         )
-    #
-    #         prob += (
-    #             current_round_south_away
-    #             + next_round_south_away
-    #             <= 1,
-    #             f"NorthSouthTravel_{i}_{k}"
-    #         )
+    for i in north_teams:
+        for k in range(1, 7):
+    
+            current_round_south_away = pulp.lpSum(
+                x[j][i][k]
+                for j in south_teams
+            )
+    
+            next_round_south_away = pulp.lpSum(
+                x[j][i][k + 1]
+                for j in south_teams
+            )
+    
+            prob += (
+                current_round_south_away
+                + next_round_south_away
+                <= 1,
+                f"NorthSouthTravel_{i}_{k}"
+            )
 
 
     # ------------------------------------------------------------
@@ -245,16 +245,16 @@ def build_model(df: pd.DataFrame):
     # during rounds 1 or 2.
     # ------------------------------------------------------------
     #
-    # for i in tourist_teams:
-    #     prob += (
-    #         pulp.lpSum(
-    #             x[i][j][k]
-    #             for j in popular_teams
-    #             for k in [1, 2]
-    #             if j != i
-    #         ) >= 1,
-    #         f"TouristRule_{i}"
-    #     )
+    for i in tourist_teams:
+        prob += (
+            pulp.lpSum(
+                x[i][j][k]
+                for j in popular_teams
+                for k in [1, 2]
+                if j != i
+            ) >= 1,
+            f"TouristRule_{i}"
+        )
 
 
     # ============================================================
