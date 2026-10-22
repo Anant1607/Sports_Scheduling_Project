@@ -42,11 +42,16 @@ def build_model(df: pd.DataFrame):
     )
 
     # x[i][j][k] = 1 if team i hosts team j in round k
-    x = pulp.LpVariable.dicts(
-        "Match",
-        (teams, teams, rounds),
-        cat="Binary"
-    )
+    x = {
+        i: {
+            j: {
+                k: prob.add_variable(f"Match_{i}_{j}_{k}", cat="Binary")
+                for k in rounds
+            }
+            for j in teams
+        }
+        for i in teams
+    }
 
 
     # ============================================================
