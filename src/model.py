@@ -174,17 +174,17 @@ def build_model(df: pd.DataFrame):
     # Prevents 3 consecutive away games.
     # ------------------------------------------------------------
     #
-    # for i in teams:
-    #     for k in range(1, 6):
-    #         prob += (
-    #             pulp.lpSum(
-    #                 x[j][i][r]
-    #                 for j in teams
-    #                 if j != i
-    #                 for r in range(k, k + 3)
-    #             ) <= 2,
-    #             f"NoThreeConsecutiveAway_{i}_{k}"
-    #         )
+    for i in teams:
+        for k in range(1, 6):
+            prob += (
+                pulp.lpSum(
+                    x[j][i][r]
+                    for j in teams
+                    if j != i
+                    for r in range(k, k + 3)
+                ) <= 2,
+                f"NoThreeConsecutiveAway_{i}_{k}"
+            )
 
 
     # ------------------------------------------------------------
@@ -193,26 +193,26 @@ def build_model(df: pd.DataFrame):
     # Each team must play exactly 2 opponents from its own group.
     # ------------------------------------------------------------
     #
-    # for i in teams:
-    #     team_group = df.loc[
-    #         df["TeamID"] == i, "Group"
-    #     ].iloc[0]
-    #
-    #     same_group_teams = (
-    #         group_1_teams
-    #         if team_group == 1
-    #         else group_2_teams
-    #     )
-    #
-    #     prob += (
-    #         pulp.lpSum(
-    #             x[i][j][k] + x[j][i][k]
-    #             for j in same_group_teams
-    #             if j != i
-    #             for k in rounds
-    #         ) == 2,
-    #         f"GroupFairness_{i}"
-    #     )
+    for i in teams:
+        team_group = df.loc[
+            df["TeamID"] == i, "Group"
+        ].iloc[0]
+    
+        same_group_teams = (
+            group_1_teams
+            if team_group == 1
+            else group_2_teams
+        )
+    
+        prob += (
+            pulp.lpSum(
+                x[i][j][k] + x[j][i][k]
+                for j in same_group_teams
+                if j != i
+                for k in rounds
+            ) == 2,
+            f"GroupFairness_{i}"
+        )
 
 
     # ------------------------------------------------------------
@@ -222,25 +222,25 @@ def build_model(df: pd.DataFrame):
     # it cannot play AWAY against a South team again in round k+1.
     # ------------------------------------------------------------
     #
-    # for i in north_teams:
-    #     for k in range(1, 7):
-    #
-    #         current_round_south_away = pulp.lpSum(
-    #             x[j][i][k]
-    #             for j in south_teams
-    #         )
-    #
-    #         next_round_south_away = pulp.lpSum(
-    #             x[j][i][k + 1]
-    #             for j in south_teams
-    #         )
-    #
-    #         prob += (
-    #             current_round_south_away
-    #             + next_round_south_away
-    #             <= 1,
-    #             f"NorthSouthTravel_{i}_{k}"
-    #         )
+    for i in north_teams:
+        for k in range(1, 7):
+    
+            current_round_south_away = pulp.lpSum(
+                x[j][i][k]
+                for j in south_teams
+            )
+    
+            next_round_south_away = pulp.lpSum(
+                x[j][i][k + 1]
+                for j in south_teams
+            )
+    
+            prob += (
+                current_round_south_away
+                + next_round_south_away
+                <= 1,
+                f"NorthSouthTravel_{i}_{k}"
+            )
 
 
     # ------------------------------------------------------------
@@ -250,16 +250,16 @@ def build_model(df: pd.DataFrame):
     # during rounds 1 or 2.
     # ------------------------------------------------------------
     #
-    # for i in tourist_teams:
-    #     prob += (
-    #         pulp.lpSum(
-    #             x[i][j][k]
-    #             for j in popular_teams
-    #             for k in [1, 2]
-    #             if j != i
-    #         ) >= 1,
-    #         f"TouristRule_{i}"
-    #     )
+    for i in tourist_teams:
+        prob += (
+            pulp.lpSum(
+                x[i][j][k]
+                for j in popular_teams
+                for k in [1, 2]
+                if j != i
+            ) >= 1,
+            f"TouristRule_{i}"
+        )
 
 
     # ============================================================
