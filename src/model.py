@@ -22,7 +22,8 @@ def build_model(df: pd.DataFrame):
     group_1_teams = df[df["Group"] == 1]["TeamID"].tolist()
     group_2_teams = df[df["Group"] == 2]["TeamID"].tolist()
 
-    popular_teams = df[df["IsPopular"] == 1]["TeamID"].tolist()
+    popularity_scores = dict(zip(df["TeamID"], df["PopularityScore"]))
+
     north_teams = df[df["Region"] == "North"]["TeamID"].tolist()
     south_teams = df[df["Region"] == "South"]["TeamID"].tolist()
     center_teams = df[df["Region"] == "Center"]["TeamID"].tolist()
@@ -86,11 +87,20 @@ def build_model(df: pd.DataFrame):
                             weight * x[i][j][k]
                         )
 
+    # Rewards tourist teams for hosting popular teams in rounds 1,2 or 3
+    for i in tourist_teams:
+        for j in teams:
+            if i != j:
+                for k in [1, 2, 3]:
+                    # Normalize the 0-100 score and apply the 10-point max weight
+                    bonus = (popularity_scores[j] / 100.0) * 10
+                    objective_terms.append(bonus * x[i][j][k])
+
     prob += pulp.lpSum(objective_terms)
 
 
     # ============================================================
-    # 4. BASE CONSTRAINTS (PHASE 1)
+    # 4. BASE CONSTRAINTS
     # ============================================================
 
     # ------------------------------------------------------------
@@ -241,29 +251,5 @@ def build_model(df: pd.DataFrame):
     #             <= 1,
     #             f"NorthSouthTravel_{i}_{k}"
     #         )
-
-
-    # ------------------------------------------------------------
-    # Tourist Rule
-    #
-    # Every tourist team must host at least one popular team
-    # during rounds 1 or 2.
-    # ------------------------------------------------------------
-    #
-    # for i in tourist_teams:
-    #     prob += (
-    #         pulp.lpSum(
-    #             x[i][j][k]
-    #             for j in popular_teams
-    #             for k in [1, 2]
-    #             if j != i
-    #         ) >= 1,
-    #         f"TouristRule_{i}"
-    #     )
-
-
-    # ============================================================
-    # RETURN MODEL AND VARIABLES
-    # ============================================================
 
     return prob, x
