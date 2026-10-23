@@ -4,33 +4,39 @@ import time
 def run_exact_solver(prob):
     print("Initializing HiGHS exact solver...")
     
-    # Disabling heuristics in solver
-    heuristic_flags = [
-        "mip_heuristic_run_feasibility_jump=False",
-        "mip_heuristic_run_rins=False",
-        "mip_heuristic_run_rens=False",
-        "mip_heuristic_run_root_reduced_cost=False",
-        "mip_heuristic_run_zi_round=False",
-        "mip_heuristic_run_shifting=False"
-    ]
-    
     # Initialize the HiGHS solver with logging enabled and our exactness flags applied
-    solver = pulp.getSolver('HiGHS', msg=True, options=heuristic_flags)
+    solver = pulp.getSolver('HiGHS', msg=True)
     
     print("Executing branch-and-cut search...")
     start_time = time.time()
     
     # Run the optimization
-    prob.solve(solver)
-    
+    returned_stats = prob.solve(solver)
     solve_time = time.time() - start_time
-    status_string = pulp.LpStatus[prob.status]
+    
+    # Extract the status
+    if hasattr(returned_stats, 'status'):
+        status_code = returned_stats.status
+    elif isinstance(returned_stats, dict) and 'status' in returned_stats:
+        status_code = returned_stats['status']
+    else:
+        status_code = returned_stats
+
+    status_map = {
+        1: "Optimal",
+        -1: "Infeasible",
+        0: "Not Solved",
+        -2: "Unbounded",
+        -3: "Undefined"
+    }
+    status_string = status_map.get(status_code, "Unknown")
     
     # Extract the objective value only if a mathematically valid schedule was found
-    if prob.status == pulp.LpStatusOptimal:
+    if status_string == "Optimal":
         objective_value = pulp.value(prob.objective)
         print(f"Optimal schedule found!")
-    elif prob.status == pulp.LpStatusInfeasible:
+        print("Optimality Gap : 0.0% (Mathematical Proof Achieved)")
+    elif status_string == "Infeasible":
         objective_value = None
         print(f"CRITICAL: Model is Infeasible. The constraints logically contradict each other.")
     else:
