@@ -1,9 +1,4 @@
 import pandas as pd
-import os
-import sys
-
-# Tell Python to look inside the src folder for your modules
-sys.path.append(os.path.abspath('src'))
 import model
 import solver
 import extractor
@@ -11,13 +6,13 @@ import extractor
 def main():
     print("Starting Operations Research League Scheduler...\n")
     
-    # Define the exact CSV file paths
-    input_file = "data/teams.csv"
+    # Define file paths
+    input_file = "input.xlsx"
     output_file = "outputs/schedule.csv"
     
-    print("1. Reading CSV input...")
+    print("1. Reading input...")
     try:
-        df_teams = pd.read_csv(input_file)
+        df_teams = pd.read_excel(input_file)
     except FileNotFoundError:
         print(f"Error: Could not find {input_file}. Please ensure the file exists.")
         return
@@ -25,8 +20,6 @@ def main():
     print("2. Building and solving the model...")
     pulp_model, decision_vars = model.build_model(df_teams)
     status, solve_time, obj_val = solver.run_exact_solver(pulp_model)
-    
-    os.makedirs('outputs', exist_ok=True)
 
     if status == 'Optimal':
         print(f"\n[+] Optimal Schedule Found in {solve_time:.4f} seconds!")
