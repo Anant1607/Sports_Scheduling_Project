@@ -10,12 +10,12 @@ import solver
 import validator
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
+PROJECT_ROOT = os.path.dirname(HERE)
 
 def main():
     parser = argparse.ArgumentParser(description="Operations Research League Scheduler")
-    parser.add_argument("--input", default=os.path.join(HERE, "input.xlsx"))
-    parser.add_argument("--output", default=os.path.join(HERE, "outputs", "schedule.csv"))
+    parser.add_argument("--input", default=os.path.join(PROJECT_ROOT, "input.xlsx"))
+    parser.add_argument("--output", default=os.path.join(PROJECT_ROOT, "outputs", "schedule.csv"))
     parser.add_argument("--time-limit", type=float, default=None,
                         help="solver time limit in seconds (default: none)")
     args = parser.parse_args()
