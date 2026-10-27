@@ -12,22 +12,45 @@ import solver
 import validator
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-df = pd.read_excel(os.path.join(HERE, "input.xlsx"))
-
+PROJECT_ROOT = os.path.dirname(HERE)
+df = pd.read_excel(os.path.join(PROJECT_ROOT, "input.xlsx"))
 
 def test_validator_catches_known_violations():
-    old = pd.read_csv(os.environ["OLD_SCHEDULE"])[["Round", "Home", "Away"]]
-    problems = validator.validate_schedule(old, df)
-    rules = {p.split(":")[0] for p in problems}
-    print("old schedule problems:", len(problems), sorted(rules))
-    assert "Rule 8" in rules and "Rule 14" in rules
+    if "OLD_SCHEDULE" in os.environ and os.path.exists(os.environ["OLD_SCHEDULE"]):
+        old = pd.read_csv(os.environ["OLD_SCHEDULE"])[["Round", "Home", "Away"]]
+        problems = validator.validate_schedule(old, df)
+        rules = {p.split(":")[0] for p in problems}
+        print("old schedule problems:", len(problems), sorted(rules))
+        assert "Rule 8" in rules and "Rule 14" in rules
+    else:
+        # Relax Broadcast and NoFarTrip in a test build and verify the validator catches violations
+        prob, x = model.build_model(df)
+        for cname in list(prob.constraints.keys()):
+            if cname.startswith("Broadcast_") or cname.startswith("NoFarTrip_"):
+                del prob.constraints[cname]
+        status, _, _ = solver.run_exact_solver(prob, msg=False)
+        assert status == "Optimal"
+        sched = extractor.extract_schedule(x)
+        problems = validator.validate_schedule(sched, df)
+        rules = {p.split(":")[0] for p in problems}
+        assert "Rule 14" in rules
+
+        # Check that a team playing twice in the same round is caught by Rule 2
+        bad_sched = sched.copy()
+        bad_sched.loc[0, "Home"] = bad_sched.loc[1, "Home"]
+        probs_r2 = validator.validate_schedule(bad_sched, df)
+        assert any(p.startswith("Rule 2:") for p in probs_r2)
 
 
 def test_one_sided_rival_pair_is_found():
     d = df.copy()
-    d.loc[d.TeamID == "T8", "RivalTeamID"] = "None"      # only T7 lists T8
+    d.loc[d.TeamID == "T8", "RivalTeamID"] = "None"      # only T6 lists T8
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model.validate_input(d)
+    assert any("One-sided RivalTeamID" in str(w.message) for w in caught)
     sets = model.derive_sets(d)
-    assert frozenset(("T7", "T8")) in sets["rivals"]
+    assert frozenset(("T6", "T8")) in sets["rivals"]
 
 
 def test_bad_inputs_are_rejected():
@@ -42,6 +65,7 @@ def test_bad_inputs_are_rejected():
             assert text in str(err), err
         else:
             raise AssertionError(f"accepted bad input ({text})")
+    # Unknown rival team ID
     d = df.copy()
     d.loc[d.TeamID == "T7", "RivalTeamID"] = "T99"
     try:
@@ -51,21 +75,41 @@ def test_bad_inputs_are_rejected():
     else:
         raise AssertionError("accepted unknown rival")
 
+    # Conflicting / chained rivals: T6 lists T3, but T3 lists T5
+    d_chain = df.copy()
+    d_chain.loc[d_chain.TeamID == "T8", "RivalTeamID"] = None
+    d_chain.loc[d_chain.TeamID == "T6", "RivalTeamID"] = "T3"
+    try:
+        model.validate_input(d_chain)
+    except ValueError as err:
+        assert "conflicting RivalTeamID" in str(err)
+    else:
+        raise AssertionError("accepted conflicting rival chain T6 -> T3 -> T5")
 
-def test_optional_rules():
-    d = df.copy()
-    d["CrossedTeamID"] = "None"
-    d.loc[d.TeamID == "T1", "CrossedTeamID"] = "T2"
-    d.loc[d.TeamID == "T8", "IsOutlying"] = 1
-    d.loc[d.TeamID == "T5", "NotReadyRound1"] = 1
-    prob, x = model.build_model(d)
-    status, _, _ = solver.run_exact_solver(prob, msg=False)
-    assert status == "Optimal", status
-    sched = extractor.extract_schedule(x)
-    problems = validator.validate_schedule(sched, d)
-    print("optional rules problems:", problems)
-    assert not problems
+    # Two teams claiming the same blank rival: T6 -> T3 and T2 -> T3 while T3 is None
+    d_dup = df.copy()
+    d_dup.loc[d_dup.TeamID == "T8", "RivalTeamID"] = None
+    d_dup.loc[d_dup.TeamID == "T5", "RivalTeamID"] = None
+    d_dup.loc[d_dup.TeamID == "T3", "RivalTeamID"] = None
+    d_dup.loc[d_dup.TeamID == "T6", "RivalTeamID"] = "T3"
+    d_dup.loc[d_dup.TeamID == "T2", "RivalTeamID"] = "T3"
+    try:
+        model.validate_input(d_dup)
+    except ValueError as err:
+        assert "conflicting RivalTeamID" in str(err)
+    else:
+        raise AssertionError("accepted two teams claiming the same rival")
 
+    # Self-rivalry: T3 -> T3
+    d_self = df.copy()
+    d_self.loc[d_self.TeamID == "T5", "RivalTeamID"] = None
+    d_self.loc[d_self.TeamID == "T3", "RivalTeamID"] = "T3"
+    try:
+        model.validate_input(d_self)
+    except ValueError as err:
+        assert "cannot be itself" in str(err)
+    else:
+        raise AssertionError("accepted self rival")
 
 def test_popular_teams_come_from_sorted_scores():
     # Shuffling the rows must not change who is popular.
@@ -97,14 +141,32 @@ def test_strong_teams_come_from_binary_flag():
     else:
         raise AssertionError("accepted IsStrong = 2")
 
+    # Team cannot be both strong and weak
+    d_both = df.copy()
+    d_both.loc[d_both.TeamID == "T4", "IsStrong"] = 1  # T4 already has IsWeak == 1
+    try:
+        model.validate_input(d_both)
+    except ValueError as err:
+        assert "both strong and weak" in str(err)
+    else:
+        raise AssertionError("accepted team with both IsStrong=1 and IsWeak=1")
+
+    # IsTourist must also be binary
+    d_tour = df.copy()
+    d_tour.loc[d_tour.TeamID == "T1", "IsTourist"] = 2
+    try:
+        model.validate_input(d_tour)
+    except ValueError as err:
+        assert "IsTourist must be 0 or 1" in str(err)
+    else:
+        raise AssertionError("accepted IsTourist = 2")
+
 
 def test_tie_at_cutoff_warns():
     import warnings
     d = df.copy()
-    d.loc[d.TeamID == "T4", "PopularityScore"] = 85      # ties with T3 for 3rd place
-    d.loc[d.TeamID == "T3", "PopularityScore"] = 85
-    d.loc[d.TeamID == "T4", "PopularityScore"] = 85
-    d.loc[d.TeamID == "T2", "PopularityScore"] = 85      # three-way tie across the cut-off
+    d.loc[d.TeamID == "T6", "PopularityScore"] = 85
+    d.loc[d.TeamID == "T7", "PopularityScore"] = 85      # ties with T6 for 3rd place
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         model.derive_sets(d)

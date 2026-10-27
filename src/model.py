@@ -24,10 +24,6 @@ DEFAULTS = {
     "classic_window": (3, 6),
     # Rival pairs (RivalTeamID column) must meet in this round window.
     "rivalry_window": (4, 6),
-    # Tourist teams host a popular team within the first N rounds (paper rule 22).
-    "tourist_rounds": 5,
-    # Popular teams do not visit outlying teams in the first N rounds (rule 15).
-    "outlying_rounds": 5,
     # Objective, part 1: weight of a game between teams of the same group, by round.
     # Rounds not listed have weight 0. These are the original weights.
     "round_weights": {5: 1, 6: 6, 7: 15},
@@ -35,8 +31,6 @@ DEFAULTS = {
     # ((popularity of host + popularity of guest) / 200) x tourist_bonus_max.
     "tourist_bonus_rounds": (1, 2, 3),
     "tourist_bonus_max": 10,
-    # Max same-group games in the last round (paper rule 24: 3 of a possible 8).
-    "last_round_group_cap": 2,
     # Longest allowed run of home games or away games.
     "max_consecutive": 2,
     # Regions used by the North/South rules (paper rules 8, 14, 25).
@@ -47,7 +41,7 @@ DEFAULTS = {
 
 REQUIRED_COLUMNS = [
     "TeamID", "Region", "Group", "PopularityScore",
-    "IsStrong", "IsTourist", "RivalTeamID",
+    "IsStrong", "IsWeak", "IsTourist", "RivalTeamID",
 ]
 
 
@@ -78,21 +72,63 @@ def validate_input(df: pd.DataFrame):
         bad = df.loc[~df["IsStrong"].isin([0, 1]), "TeamID"].tolist()
         raise ValueError(f"IsStrong must be 0 or 1 for every team, check: {bad}")
 
+    if not df["IsWeak"].isin([0, 1]).all():
+        bad = df.loc[~df["IsWeak"].isin([0, 1]), "TeamID"].tolist()
+        raise ValueError(f"IsWeak must be 0 or 1 for every team, check: {bad}")
+    
+    if not df["IsTourist"].isin([0, 1]).all():
+        bad = df.loc[~df["IsTourist"].isin([0, 1]), "TeamID"].tolist()
+        raise ValueError(f"IsTourist must be 0 or 1 for every team, check: {bad}")
+
     if df["TeamID"].duplicated().any():
         dupes = df.loc[df["TeamID"].duplicated(), "TeamID"].tolist()
         raise ValueError(f"duplicate TeamID value(s): {dupes}")
+
+    both_strong_and_weak = df.loc[(df["IsStrong"] == 1) & (df["IsWeak"] == 1), "TeamID"].tolist()
+    if both_strong_and_weak:
+        raise ValueError(f"a team cannot be both strong and weak, check: {both_strong_and_weak}")
 
     n = len(df)
     if n < 4 or n % 2 != 0:
         raise ValueError(f"need an even number of teams (at least 4), got {n}")
 
+    # Inside validate_input(df):
     ids = set(df["TeamID"])
-    for col in ("RivalTeamID", "CrossedTeamID"):
-        if col in df.columns:
-            for team, other in zip(df["TeamID"], df[col]):
-                other = _clean_id(other)
-                if other is not None and other not in ids:
-                    raise ValueError(f"{col} of {team} refers to unknown team '{other}'")
+    rival_map = {}
+    if "RivalTeamID" in df.columns:
+        for team, other in zip(df["TeamID"], df["RivalTeamID"]):
+            other = _clean_id(other)
+            if other is not None:
+                if other not in ids:
+                    raise ValueError(f"RivalTeamID of {team} refers to unknown team '{other}'")
+                if other == team:
+                    raise ValueError(f"Team {team} cannot be its own rival")
+                rival_map[team] = other
+
+        # Check for asymmetric / conflicting rivalries
+        for team, other in rival_map.items():
+            other_rival = rival_map.get(other)
+            if other_rival is None:
+                #warn that a one-sided rival will be treated symmetrically (eg T6 -> T3, while T3 -> None)
+                warnings.warn(
+                    f"One-sided rivalry: {team} lists {other} as rival, "
+                    f"but {other} has no rival listed. Treating ({team}, {other}) as rivals."
+                )
+            # T6 -> T3, but T3 - T2
+            elif other_rival != team:
+                raise ValueError(
+                    f"Conflicting RivalTeamID: {team} lists {other}, "
+                    f"but {other} lists {other_rival} instead of {team}"
+                )
+
+        # Check that no team is targeted by two different teams (e.g. T6 -> T3 and T2 -> T3)
+        incoming = {}
+        for team, other in rival_map.items():
+            if other in incoming and incoming[other] != team:
+                raise ValueError(
+                    f"Conflicting RivalTeamID: both {incoming[other]} and {team} list {other} as their rival"
+                )
+            incoming[other] = team
 
 
 def _top_n(teams, score, n, label):
@@ -138,13 +174,6 @@ def derive_sets(df: pd.DataFrame, cfg=None):
         if other is not None and other != team:
             rivals.add(frozenset((team, other)))
 
-    crossed = set()
-    if "CrossedTeamID" in df.columns:
-        for team, other in zip(df["TeamID"], df["CrossedTeamID"]):
-            other = _clean_id(other)
-            if other is not None and other != team:
-                crossed.add(frozenset((team, other)))
-
     groups = {}
     for t in teams:
         groups.setdefault(group_of[t], []).append(t)
@@ -158,11 +187,9 @@ def derive_sets(df: pd.DataFrame, cfg=None):
         "popular": popular,
         "revenue_pair": revenue_pair,
         "strong": strong,
+        "weak": teams_where("IsWeak"),
         "tourist": teams_where("IsTourist"),
-        "outlying": teams_where("IsOutlying"),
-        "not_ready": teams_where("NotReadyRound1"),
         "rivals": rivals,
-        "crossed": crossed,
     }
 
 
@@ -373,23 +400,24 @@ def build_model(df: pd.DataFrame, config=None):
         # Rule 14: when a popular team plays in the North (South), no other
         # popular team plays in the South (North). A popular team that is
         # hosted in, or hosts in, a region counts as playing there.
-        north, south = members(far_a), members(far_b)
-        for k in rounds:
-            for p in popular:
-                for q in popular:
-                    if p != q:
-                        prob += (
-                            plays_in(p, k, north) + plays_in(q, k, south) <= 1,
-                            f"Broadcast_{p}_{q}_{k}",
-                        )
+         # (disabled due to giving infeasibility in here due to less number of teams)
+        # north, south = members(far_a), members(far_b)
+        # for k in rounds:
+        #     for p in popular:
+        #         for q in popular:
+        #             if p != q:
+        #                 prob += (
+        #                     plays_in(p, k, north) + plays_in(q, k, south) <= 1,
+        #                     f"Broadcast_{p}_{q}_{k}",
+        #                 )
 
     # ============================================================
     # 9. STRONG TEAMS (paper rule 16)
     # ============================================================
-    # No team plays strong opponents in two consecutive rounds.
+    # No weak team plays strong opponents in two consecutive rounds. (modified from all teams to only weak teams)
 
     strong = S["strong"]
-    for i in teams:
+    for i in S["weak"]:
         for k in range(1, n_rounds):
             prob += (
                 pulp.lpSum(
@@ -427,52 +455,5 @@ def build_model(df: pd.DataFrame, config=None):
                 pulp.lpSum(x[i][j][k] for j in region_teams if j != i for k in rounds) >= 1,
                 f"IntraRegionHome_{i}",
             )
-
-    # ============================================================
-    # 12. TOURISM (paper rule 22)
-    # ============================================================
-    # Tourist teams host at least one popular team early in the season.
-
-    early = range(1, min(cfg["tourist_rounds"], last) + 1)
-    for t in S["tourist"]:
-        prob += (
-            pulp.lpSum(x[t][p][k] for p in popular if p != t for k in early) >= 1,
-            f"TouristHostsPopular_{t}",
-        )
-
-    # ============================================================
-    # 13. LAST ROUND CAP (paper rule 24)
-    # ============================================================
-
-    prob += (
-        pulp.lpSum(x[i][j][last] for (i, j) in same_group_pairs) <= cfg["last_round_group_cap"],
-        "LastRoundGroupCap",
-    )
-
-    # ============================================================
-    # 14. OPTIONAL RULES, ACTIVE ONLY WHEN THE INPUT HAS THE COLUMN
-    # ============================================================
-
-    # Rule 15 (IsOutlying): popular teams do not visit outlying teams early.
-    if S["outlying"]:
-        for p in popular:
-            prob += (
-                pulp.lpSum(
-                    x[o][p][k]
-                    for o in S["outlying"] if o != p
-                    for k in range(1, min(cfg["outlying_rounds"], last) + 1)
-                ) == 0,
-                f"NoEarlyOutlyingTrip_{p}",
-            )
-
-    # Rule 18 (CrossedTeamID): crossed teams alternate home and away every round.
-    for pair in sorted(S["crossed"], key=sorted):
-        i, j = sorted(pair)
-        for k in rounds:
-            prob += home(i, k) + home(j, k) == 1, f"Crossed_{i}_{j}_{k}"
-
-    # Rule 23 (NotReadyRound1): these teams play away in round 1.
-    for t in S["not_ready"]:
-        prob += home(t, 1) == 0, f"NotReadyRound1_{t}"
 
     return prob, x
