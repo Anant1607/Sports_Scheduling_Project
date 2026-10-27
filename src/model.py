@@ -1,483 +1,478 @@
-# src/model.py
+# model.py
+#
+# Integer programming model for a single round-robin league schedule,
+# adapted from Duran et al. (2007), "Scheduling the Chilean Soccer League
+# by Integer Programming", Interfaces 37(6).
+#
+# Decision variable: x[i][j][k] = 1 if team i hosts team j in round k.
+# Variables only exist for i != j, so no self-play constraint is needed.
 
-import pulp
+import warnings
+
 import pandas as pd
+import pulp
 
 
 # ============================================================
-# 1. DATA INGESTION AND SET CREATION
+# 0. CONFIGURATION
+# ============================================================
+# Windows and thresholds are scaled for an 8-team, 7-round league.
+# Override any of them with build_model(df, config={...}).
+
+DEFAULTS = {
+    # Classic matches between popular teams must fall in this round window.
+    "classic_window": (3, 6),
+    # Rival pairs (RivalTeamID column) must meet in this round window.
+    "rivalry_window": (4, 6),
+    # Tourist teams host a popular team within the first N rounds (paper rule 22).
+    "tourist_rounds": 5,
+    # Popular teams do not visit outlying teams in the first N rounds (rule 15).
+    "outlying_rounds": 5,
+    # Objective, part 1: weight of a game between teams of the same group, by round.
+    # Rounds not listed have weight 0. These are the original weights.
+    "round_weights": {5: 1, 6: 6, 7: 15},
+    # Objective, part 2: a tourist team that hosts any team in these rounds earns
+    # ((popularity of host + popularity of guest) / 200) x tourist_bonus_max.
+    "tourist_bonus_rounds": (1, 2, 3),
+    "tourist_bonus_max": 10,
+    # Max same-group games in the last round (paper rule 24: 3 of a possible 8).
+    "last_round_group_cap": 2,
+    # Longest allowed run of home games or away games.
+    "max_consecutive": 2,
+    # Regions used by the North/South rules (paper rules 8, 14, 25).
+    "far_regions": ("North", "South"),
+    # Popular teams = the n_popular teams with the highest PopularityScore.
+    "n_popular": 3,
+}
+
+REQUIRED_COLUMNS = [
+    "TeamID", "Region", "Group", "PopularityScore",
+    "IsStrong", "IsTourist", "RivalTeamID",
+]
+
+
+# ============================================================
+# 1. INPUT VALIDATION AND SET CREATION
 # ============================================================
 
-def build_model(df: pd.DataFrame):
+def _clean_id(value):
+    """Return a stripped string ID, or None for blanks, NaN and the text 'None'."""
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    return None if text in ("", "None") else text
 
-    # -------------------------
-    # Primary sets
-    # -------------------------
+
+def validate_input(df: pd.DataFrame):
+    """Raise ValueError with a readable message if the input cannot be modelled."""
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"input is missing required column(s): {missing}")
+
+    values = pd.to_numeric(df["PopularityScore"], errors="coerce")
+    if values.isna().any():
+        bad = df.loc[values.isna(), "TeamID"].tolist()
+        raise ValueError(f"PopularityScore must be a number for every team, check: {bad}")
+
+    if not df["IsStrong"].isin([0, 1]).all():
+        bad = df.loc[~df["IsStrong"].isin([0, 1]), "TeamID"].tolist()
+        raise ValueError(f"IsStrong must be 0 or 1 for every team, check: {bad}")
+
+    if df["TeamID"].duplicated().any():
+        dupes = df.loc[df["TeamID"].duplicated(), "TeamID"].tolist()
+        raise ValueError(f"duplicate TeamID value(s): {dupes}")
+
+    n = len(df)
+    if n < 4 or n % 2 != 0:
+        raise ValueError(f"need an even number of teams (at least 4), got {n}")
+
+    ids = set(df["TeamID"])
+    for col in ("RivalTeamID", "CrossedTeamID"):
+        if col in df.columns:
+            for team, other in zip(df["TeamID"], df[col]):
+                other = _clean_id(other)
+                if other is not None and other not in ids:
+                    raise ValueError(f"{col} of {team} refers to unknown team '{other}'")
+
+
+def _top_n(teams, score, n, label):
+    """Sort teams by score, highest first, and return the first n.
+    Ties keep the order of the sheet. A tie that straddles the cut-off is
+    reported, because the sheet order then decides who is in."""
+    ranked = sorted(teams, key=lambda t: -score[t])
+    if 0 < n < len(ranked) and score[ranked[n - 1]] == score[ranked[n]]:
+        warnings.warn(
+            f"{label}: {ranked[n - 1]} and {ranked[n]} tie at {score[ranked[n]]} "
+            f"at the cut-off for the top {n}. Sheet order decides. "
+            f"Change a score to break the tie."
+        )
+    return ranked[:n]
+
+
+def derive_sets(df: pd.DataFrame, cfg=None):
+    """Build every team subset the model and the validator need, from the data."""
+    cfg = {**DEFAULTS, **(cfg or {})}
     teams = df["TeamID"].tolist()
-    rounds = range(1, 8)
+    group_of = dict(zip(df["TeamID"], df["Group"]))
+    region_of = dict(zip(df["TeamID"], df["Region"]))
+    score = dict(zip(df["TeamID"], pd.to_numeric(df["PopularityScore"])))
 
-    # -------------------------
-    # Subsets
-    # -------------------------
-    group_1_teams = df[df["Group"] == 1]["TeamID"].tolist()
-    group_2_teams = df[df["Group"] == 2]["TeamID"].tolist()
+    # Popular teams: sort by PopularityScore and take the top n_popular.
+    popular = _top_n(teams, score, cfg["n_popular"], "PopularityScore")
 
-    popularity_scores = dict(zip(df["TeamID"], df["PopularityScore"]))
+    # Revenue pair (paper rule 11): the two most popular teams (popular is
+    # already sorted, highest score first).
+    revenue_pair = tuple(popular[:2]) if len(popular) >= 2 else None
 
-    north_teams = df[df["Region"] == "North"]["TeamID"].tolist()
-    south_teams = df[df["Region"] == "South"]["TeamID"].tolist()
-    center_teams = df[df["Region"] == "Center"]["TeamID"].tolist()
+    # Strong teams: the teams flagged 1 in the IsStrong column.
+    strong = df.loc[df["IsStrong"] == 1, "TeamID"].tolist()
 
-    tourist_teams = df[df["IsTourist"] == 1]["TeamID"].tolist()
-    strong_teams = df[df["IsStrong"] == 1]["TeamID"].tolist()
-    weak_teams = df[df["IsWeak"] == 1]["TeamID"].tolist()
+    def teams_where(col, value=1):
+        return df.loc[df[col] == value, "TeamID"].tolist() if col in df.columns else []
+
+    # Rival pairs are read from both directions, so a pair listed on one row
+    # only is still found.
+    rivals = set()
+    for team, other in zip(df["TeamID"], df["RivalTeamID"]):
+        other = _clean_id(other)
+        if other is not None and other != team:
+            rivals.add(frozenset((team, other)))
+
+    crossed = set()
+    if "CrossedTeamID" in df.columns:
+        for team, other in zip(df["TeamID"], df["CrossedTeamID"]):
+            other = _clean_id(other)
+            if other is not None and other != team:
+                crossed.add(frozenset((team, other)))
+
+    groups = {}
+    for t in teams:
+        groups.setdefault(group_of[t], []).append(t)
+
+    return {
+        "teams": teams,
+        "score": score,
+        "group_of": group_of,
+        "region_of": region_of,
+        "groups": groups,
+        "popular": popular,
+        "revenue_pair": revenue_pair,
+        "strong": strong,
+        "tourist": teams_where("IsTourist"),
+        "outlying": teams_where("IsOutlying"),
+        "not_ready": teams_where("NotReadyRound1"),
+        "rivals": rivals,
+        "crossed": crossed,
+    }
 
 
-    # ============================================================
-    # 2. MODEL AND VARIABLE INITIALIZATION
-    # ============================================================
+# ============================================================
+# 2. MODEL
+# ============================================================
 
-    prob = pulp.LpProblem(
-        "Chilean_League_Scheduler",
-        pulp.LpMaximize
-    )
+def build_model(df: pd.DataFrame, config=None):
+    cfg = {**DEFAULTS, **(config or {})}
+    validate_input(df)
+    S = derive_sets(df, cfg)
 
-    # x[i][j][k] = 1 if team i hosts team j in round k
+    teams = S["teams"]
+    group_of = S["group_of"]
+    region_of = S["region_of"]
+    popular = S["popular"]
+    n_rounds = len(teams) - 1                      # single round-robin
+    rounds = range(1, n_rounds + 1)
+    last = n_rounds
+
+    def members(region):
+        return [t for t in teams if region_of[t] == region]
+
+    prob = pulp.LpProblem("League_Scheduler", pulp.LpMaximize)
+
+    # PuLP 3.0 and later create variables through the problem object.
+    # Older versions use the LpVariable constructor.
+    def new_binary(name):
+        if hasattr(prob, "add_variable"):
+            return prob.add_variable(name, cat="Binary")
+        return pulp.LpVariable(name, cat="Binary")
+
+    # x[i][j][k] = 1 if team i hosts team j in round k (i != j only)
     x = {
         i: {
-            j: {
-                k: prob.add_variable(f"Match_{i}_{j}_{k}", cat="Binary")
-                for k in rounds
-            }
-            for j in teams
+            j: {k: new_binary(f"Match_{i}_{j}_{k}") for k in rounds}
+            for j in teams if j != i
         }
         for i in teams
     }
 
+    # ---- small helpers returning linear expressions ----
+    def home(i, k):
+        """1 if team i plays at home in round k."""
+        return pulp.lpSum(x[i][j][k] for j in teams if j != i)
+
+    def away(i, k):
+        """1 if team i plays away in round k."""
+        return pulp.lpSum(x[j][i][k] for j in teams if j != i)
+
+    def visits(t, k, hosts):
+        """1 if team t is a visitor at one of `hosts` in round k."""
+        return pulp.lpSum(x[h][t][k] for h in hosts if h != t)
+
+    def plays_in(t, k, region_teams):
+        """1 if team t plays a round-k game staged in the region of `region_teams`.
+        Covers visits to that region and home games of t when t belongs to it."""
+        own = home(t, k) if t in region_teams else 0
+        return visits(t, k, region_teams) + own
 
     # ============================================================
-    # 3. OBJECTIVE FUNCTION
+    # 3. OBJECTIVE
     # ============================================================
+    # Part 1: reward games between teams of the same group in late rounds.
+    # Part 2: reward tourist teams for hosting popular teams early. The reward
+    # uses the popularity of both the host and the guest.
 
-    objective_terms = []
+    weights = {k: w for k, w in cfg["round_weights"].items() if k in rounds}
 
-    # Weight later rounds more heavily.
-    # Only intra-group matches in rounds 5, 6 and 7
-    # contribute to the objective.
-    round_weights = {
-        5: 1,
-        6: 6,
-        7: 15
-    }
+    same_group_pairs = [
+        (i, j) for i in teams for j in teams
+        if i != j and group_of[i] == group_of[j]
+    ]
+    objective_terms = [
+        w * x[i][j][k] for (i, j) in same_group_pairs for k, w in weights.items()
+    ]
 
-    for i in teams:
-        for j in teams:
-
-            # matches between same groups given weightage
-            if (
-                df.loc[df["TeamID"] == i, "Group"].iloc[0]
-                ==
-                df.loc[df["TeamID"] == j, "Group"].iloc[0]
-            ):
-                for k in rounds:
-
-                    if k >= 5:
-                        weight = round_weights[k]
-                        objective_terms.append(
-                            weight * x[i][j][k]
-                        )
-
-    # Rewards tourist teams for hosting popular teams in rounds 1,2 or 3
-    for i in tourist_teams:
+    score = S["score"]
+    for i in S["tourist"]:
         for j in teams:
             if i != j:
-                for k in [1, 2, 3]:
-                    # Normalize the 0-100 score and apply the 10-point max weight
-                    bonus = ((popularity_scores[j]+popularity_scores[i]) / 200.0) * 10
-                    objective_terms.append(bonus * x[i][j][k])
+                # Scores are on a 0-100 scale, so (sum / 200) is between 0 and 1.
+                bonus = ((score[j] + score[i]) / 200.0) * cfg["tourist_bonus_max"]
+                for k in cfg["tourist_bonus_rounds"]:
+                    if k in rounds:
+                        objective_terms.append(bonus * x[i][j][k])
 
     prob += pulp.lpSum(objective_terms)
 
-
     # ============================================================
-    # 4. BASE CONSTRAINTS
+    # 4. BASIC CONSTRAINTS (paper rules 1, 2, 3)
     # ============================================================
 
-    # ------------------------------------------------------------
-    # No Self-Play
-    # ------------------------------------------------------------
+    # Rule 1: every pair meets exactly once.
+    for a in range(len(teams)):
+        for b in range(a + 1, len(teams)):
+            i, j = teams[a], teams[b]
+            prob += (
+                pulp.lpSum(x[i][j][k] + x[j][i][k] for k in rounds) == 1,
+                f"SingleRoundRobin_{i}_{j}",
+            )
+
+    # Rule 2: every team plays exactly once per round.
     for i in teams:
         for k in rounds:
-            prob += (
-                x[i][i][k] == 0,
-                f"NoSelfPlay_{i}_{k}"
-            )
+            prob += home(i, k) + away(i, k) == 1, f"OneMatchPerRound_{i}_{k}"
 
-
-    # ------------------------------------------------------------
-    # Single Round-Robin
-    #
-    # Every pair of distinct teams plays exactly once.
-    #
-    # x[i][j][k] = i hosts j
-    # x[j][i][k] = j hosts i
-    # ------------------------------------------------------------
+    # Rule 3: balanced number of home games (3 or 4 for 7 rounds).
+    low, high = n_rounds // 2, (n_rounds + 1) // 2
     for i in teams:
-        for j in teams:
+        total_home = pulp.lpSum(home(i, k) for k in rounds)
+        prob += total_home >= low, f"HomeCountMin_{i}"
+        prob += total_home <= high, f"HomeCountMax_{i}"
 
-            if i < j:
-                prob += (
-                    pulp.lpSum(
-                        x[i][j][k] + x[j][i][k]
-                        for k in rounds
-                    ) == 1,
-                    f"SingleRoundRobin_{i}_{j}"
-                )
+    # ============================================================
+    # 5. HOME / AWAY SEQUENCES (adapts paper rules 4 and 5)
+    # ============================================================
+    # No run of more than `max_consecutive` home games, or away games.
 
-
-    # ------------------------------------------------------------
-    # One Match Per Round
-    #
-    # Each team must play exactly one match in every round.
-    # ------------------------------------------------------------
+    m = cfg["max_consecutive"]
     for i in teams:
-        for k in rounds:
-
+        for k in range(1, n_rounds - m + 1):
+            window = range(k, k + m + 1)
             prob += (
-                pulp.lpSum(
-                    x[i][j][k] + x[j][i][k]
-                    for j in teams
-                    if j != i
-                ) == 1,
-                f"OneMatchPerRound_{i}_{k}"
+                pulp.lpSum(home(i, r) for r in window) <= m,
+                f"MaxConsecutiveHome_{i}_{k}",
+            )
+            prob += (
+                pulp.lpSum(away(i, r) for r in window) <= m,
+                f"MaxConsecutiveAway_{i}_{k}",
             )
 
-    # ------------------------------------------------------------
-    # Home/Away Balance
-    #
-    # Prevents 3 consecutive home games.
-    # ------------------------------------------------------------
-    #
+    # ============================================================
+    # 6. GROUP HOME BALANCE (paper rule 7)
+    # ============================================================
+    # Against its group rivals a team hosts about half of them.
+
     for i in teams:
-        for k in range(1, 6):
-            prob += (
-                pulp.lpSum(
-                    x[i][j][r]
-                    for j in teams
-                    if j != i
-                    for r in range(k, k + 3)
-                ) <= 2,
-                f"NoThreeConsecutiveHome_{i}_{k}"
-            )
+        rivals_in_group = [j for j in S["groups"][group_of[i]] if j != i]
+        count = len(rivals_in_group)
+        group_home = pulp.lpSum(x[i][j][k] for j in rivals_in_group for k in rounds)
+        prob += group_home >= count // 2, f"GroupHomeMin_{i}"
+        prob += group_home <= (count + 1) // 2, f"GroupHomeMax_{i}"
 
+    # ============================================================
+    # 7. GEOGRAPHIC TRAVEL RULES (paper rules 8, 9, 10)
+    # ============================================================
 
-    # ------------------------------------------------------------
-    # Away Balance
-    #
-    # Prevents 3 consecutive away games.
-    # ------------------------------------------------------------
-    
-    for i in teams:
-        for k in range(1, 6):
-            prob += (
-                pulp.lpSum(
-                    x[j][i][r]
-                    for j in teams
-                    if j != i
-                    for r in range(k, k + 3)
-                ) <= 2,
-                f"NoThreeConsecutiveAway_{i}_{k}"
-            )
-
-
-   # ------------------------------------------------------------
-    # Group Fairness
-    #
-    # No team plays all its group matches strictly at home or strictly away.
-    # Since each team has 3 opponents in its group, it must play 
-    # at least 1 and at most 2 home games against them.
-    # ------------------------------------------------------------
-    for i in teams:
-        team_group = df.loc[
-            df["TeamID"] == i, "Group"
-        ].iloc[0]
-
-        same_group_teams = (
-            group_1_teams
-            if team_group == 1
-            else group_2_teams
-        )
-
-        # Isolate strictly HOME games against group rivals
-        group_home_games = pulp.lpSum(
-            x[i][j][k]
-            for j in same_group_teams
-            if j != i
-            for k in rounds
-        )
-
-        # Must play at least 1 home game against the group (prevents all 3 away)
-        prob += (
-            group_home_games >= 1, 
-            f"GroupFairness_MinHome_{i}"
-        )
-
-        # Must play at most 2 home games against the group (prevents all 3 at home)
-        prob += (
-            group_home_games <= 2, 
-            f"GroupFairness_MaxHome_{i}"
-        )
-
-
-    # ------------------------------------------------------------
-    # Regional Travel
-    #
-    # If a North team plays AWAY against a South team in round k,
-    # it cannot play AWAY against a South team again in round k+1.
-    # ------------------------------------------------------------
-    #
-    for i in north_teams:
-        for k in range(1, 7):
-    
-            current_round_south_away = pulp.lpSum(
-                x[j][i][k]
-                for j in south_teams
-            )
-    
-            next_round_south_away = pulp.lpSum(
-                x[j][i][k + 1]
-                for j in south_teams
-            )
-    
-            prob += (
-                current_round_south_away
-                + next_round_south_away
-                <= 1,
-                f"NorthSouthTravel_{i}_{k}"
-            )
-
-    # ------------------------------------------------------------
-    # Geographic Constraint (Center Teams)
-    #
-    # When a Center team plays two consecutive away games, 
-    # at least one of the games will be played in the Center.
-    # ------------------------------------------------------------
-    
-    # Identify Center and Non-Center teams
-    center_teams = df[df["Region"] == "Center"]["TeamID"].tolist()
-    non_center_teams = df[df["Region"] != "Center"]["TeamID"].tolist()
-
-    for i in center_teams:
-        # Loop through all consecutive pairs of rounds (e.g., 1&2, 2&3, etc.)
-        for k in rounds[:-1]: 
-            prob += (
-                pulp.lpSum(
-                    # x[j][i] means 'j' is home and 'i' is away
-                    x[j][i][k] + x[j][i][k+1] 
-                    for j in non_center_teams
-                ) <= 1,
-                f"Center_Geographic_Rule_{i}_Rounds_{k}_{k+1}"
-            )
-
-    # ------------------------------------------------------------
-    # Geographic Constraint (North & South Teams)
-    #
-    # When a North (South) team plays two consecutive away games, 
-    # at least one of the games will be played in the North (South).
-    # ------------------------------------------------------------
-    
-    north_teams = df[df["Region"] == "North"]["TeamID"].tolist()
-    south_teams = df[df["Region"] == "South"]["TeamID"].tolist()
-    
-    non_north_teams = df[df["Region"] != "North"]["TeamID"].tolist()
-    non_south_teams = df[df["Region"] != "South"]["TeamID"].tolist()
-
-    # Rule for North Teams
-    for i in north_teams:
-        for k in rounds[:-1]: 
-            prob += (
-                pulp.lpSum(
-                    x[j][i][k] + x[j][i][k+1] 
-                    for j in non_north_teams
-                ) <= 1,
-                f"North_Geographic_Rule_{i}_Rounds_{k}_{k+1}"
-            )
-
-    # Rule for South Teams
-    for i in south_teams:
-        for k in rounds[:-1]: 
-            prob += (
-                pulp.lpSum(
-                    x[j][i][k] + x[j][i][k+1] 
-                    for j in non_south_teams
-                ) <= 1,
-                f"South_Geographic_Rule_{i}_Rounds_{k}_{k+1}"
-            )
-
-    # ------------------------------------------------------------
-    # Popular Teams Revenue Balance
-    #
-    # If a team plays at home (away) against Colo Colo (T1), 
-    # it plays away (at home) against Universidad de Chile (T2).
-    # ------------------------------------------------------------
-    
-    colo_colo = "T1"
-    u_chile = "T2"
-    
-    for h in teams:
-        # Apply only to teams that are not Colo Colo or Universidad de Chile
-        if h != colo_colo and h != u_chile:
-            prob += (
-                pulp.lpSum(
-                    # x[h][i] means 'h' is playing at home against 'i'
-                    x[h][colo_colo][k] + x[h][u_chile][k]
-                    for k in rounds
-                ) == 1,
-                f"Revenue_Balance_COLO_UCH_{h}"
-            )
-
-    # ------------------------------------------------------------
-    # Classic Matchups Scheduling Window
-    #
-    # The three classic matchups between the popular teams (T1, T2, T3) 
-    # must be played between the 3rd and 6th rounds.
-    # ------------------------------------------------------------
-    
-    popular_teams = ["T1", "T2", "T3"]
-    
-    # Loop through all rounds and forbid classic matchups outside the 3-6 window
-    for k in rounds:
-        if k < 3 or k > 6:
-            prob += (
-                pulp.lpSum(
-                    x[i][j][k]
-                    for i in popular_teams
-                    for j in popular_teams
-                    if i != j
-                ) == 0,
-                f"No_Classic_Matchups_Round_{k}"
-            )
-
-    # ------------------------------------------------------------
-    # Popular Teams Home Balance for Classics
-    #
-    # Each of the three popular teams (T1, T2, T3) plays exactly 
-    # one classic matchup at home.
-    # ------------------------------------------------------------
-    
-    popular_teams = ["T1", "T2", "T3"]
-    
-    for i in popular_teams:
-        prob += (
-            pulp.lpSum(
-                # x[i][j] means team 'i' is hosting team 'j'
-                x[i][j][k]
-                for j in popular_teams 
-                if j != i
-                for k in rounds
-            ) == 1,
-            f"Exactly_One_Home_Classic_{i}"
-        )
-
-    # ------------------------------------------------------------
-    # Broadcasting Constraint (Mobile Units)
-    #
-    # When a popular team plays in the North (South), neither of 
-    # the two other popular teams can play in the South (North).
-    # ------------------------------------------------------------
-    
-    north_teams = df[df["Region"] == "North"]["TeamID"].tolist()
-    south_teams = df[df["Region"] == "South"]["TeamID"].tolist()
-    popular_teams = ["T1", "T2", "T3"]
-
-    for k in rounds:
-        # Evaluate every unique pair of popular teams
-        for j in popular_teams:
-            for h in popular_teams:
-                if j != h:
+    # Rule 8: a team of a far region (North/South) on two consecutive away games
+    # may not visit the opposite far region in either game. Equivalent form: a
+    # visit to the opposite region cannot be next to any other away game.
+    far_a, far_b = cfg["far_regions"]
+    for own, other in ((far_a, far_b), (far_b, far_a)):
+        own_teams, other_teams = members(own), members(other)
+        for t in own_teams:
+            for k in range(1, n_rounds):
+                for a, b in ((k, k + 1), (k + 1, k)):
                     prob += (
-                        pulp.lpSum(x[n][j][k] for n in north_teams) + 
-                        pulp.lpSum(x[s][h][k] for s in south_teams) <= 1,
-                        f"Broadcast_North_South_{j}_and_{h}_Round_{k}"
+                        visits(t, a, other_teams) + away(t, b) <= 1,
+                        f"NoFarTrip_{t}_{a}_{b}",
                     )
 
-    # ------------------------------------------------------------
-    # Strong Teams Sequencing
-    #
-    # No team may play two consecutive games against a strong team.
-    # ------------------------------------------------------------
-    
-    # Identify all strong teams dynamically using the dataset column
-    strong_teams = df[df["IsStrong"] == 1]["TeamID"].tolist()
-    
-    for i in teams:
-        # Loop through all consecutive pairs of rounds (k and k+1)
-        for k in rounds[:-1]:
-            prob += (
-                pulp.lpSum(
-                    # Account for playing a strong team at home OR away in round k
-                    x[i][j][k] + x[j][i][k] + 
-                    # Account for playing a strong team at home OR away in round k+1
-                    x[i][j][k+1] + x[j][i][k+1]
-                    for j in strong_teams
-                    if j != i
-                ) <= 1,
-                f"No_Consecutive_Strong_Teams_{i}_Rounds_{k}_{k+1}"
-            )
-
-    # ------------------------------------------------------------
-    # Rivalry Match Timing (Mid-to-Late Season)
-    # ------------------------------------------------------------
-    for i in teams:
-        rival_val = df.loc[df["TeamID"] == i, "RivalTeamID"].iloc[0]
-        
-        if pd.notna(rival_val) and str(rival_val).strip() != "None":
-            
-            rival_id = str(rival_val).strip()
-            
-            # Ensure we only add the constraint once per pair
-            if i < rival_id:
+    # Rules 9 and 10: on two consecutive away games, at least one is played in
+    # the team's own region. Applied to every region in the data.
+    for region in sorted(set(region_of.values())):
+        own_teams = members(region)
+        outside = [t for t in teams if region_of[t] != region]
+        for t in own_teams:
+            for k in range(1, n_rounds):
                 prob += (
-                    pulp.lpSum(
-                        x[i][rival_id][k] + x[rival_id][i][k]
-                        for k in [4, 5, 6]
-                    ) == 1,
-                    f"RivalryTiming_{i}_{rival_id}"
+                    visits(t, k, outside) + visits(t, k + 1, outside) <= 1,
+                    f"OwnRegionTrip_{region}_{t}_{k}",
                 )
 
-    # ------------------------------------------------------------
-    # Intra-Regional Home Games
-    #
-    # Each North (South) team shall play at least once at home 
-    # against a North (South) team.
-    # ------------------------------------------------------------
-    
-    north_teams = df[df["Region"] == "North"]["TeamID"].tolist()
-    south_teams = df[df["Region"] == "South"]["TeamID"].tolist()
+    # ============================================================
+    # 8. POPULAR TEAMS (paper rules 11, 12, 13, 14)
+    # ============================================================
 
-    # Rule for North Teams
-    for i in north_teams:
+    # Rule 11: a team hosts exactly one of the two most popular teams, so it
+    # is home against one and away against the other.
+    if S["revenue_pair"] is not None:
+        a, b = S["revenue_pair"]
+        for h in teams:
+            if h not in (a, b):
+                prob += (
+                    pulp.lpSum(x[h][a][k] + x[h][b][k] for k in rounds) == 1,
+                    f"RevenueBalance_{h}",
+                )
+
+    if len(popular) >= 2:
+        # Rule 12: classic matches only inside the window.
+        w_start, w_end = cfg["classic_window"]
+        for k in rounds:
+            if k < w_start or k > w_end:
+                prob += (
+                    pulp.lpSum(x[i][j][k] for i in popular for j in popular if i != j) == 0,
+                    f"NoClassicInRound_{k}",
+                )
+
+        # Rule 13: each popular team hosts about half of its classics
+        # (exactly one when there are three popular teams).
+        opponents = len(popular) - 1
+        for i in popular:
+            hosted = pulp.lpSum(x[i][j][k] for j in popular if j != i for k in rounds)
+            prob += hosted >= opponents // 2, f"ClassicHomeMin_{i}"
+            prob += hosted <= (opponents + 1) // 2, f"ClassicHomeMax_{i}"
+
+        # Rule 14: when a popular team plays in the North (South), no other
+        # popular team plays in the South (North). A popular team that is
+        # hosted in, or hosts in, a region counts as playing there.
+        north, south = members(far_a), members(far_b)
+        for k in rounds:
+            for p in popular:
+                for q in popular:
+                    if p != q:
+                        prob += (
+                            plays_in(p, k, north) + plays_in(q, k, south) <= 1,
+                            f"Broadcast_{p}_{q}_{k}",
+                        )
+
+    # ============================================================
+    # 9. STRONG TEAMS (paper rule 16)
+    # ============================================================
+    # No team plays strong opponents in two consecutive rounds.
+
+    strong = S["strong"]
+    for i in teams:
+        for k in range(1, n_rounds):
+            prob += (
+                pulp.lpSum(
+                    x[i][j][r] + x[j][i][r]
+                    for j in strong if j != i
+                    for r in (k, k + 1)
+                ) <= 1,
+                f"NoConsecutiveStrong_{i}_{k}",
+            )
+
+    # ============================================================
+    # 10. RIVALRIES (paper rule 19)
+    # ============================================================
+
+    r_start, r_end = cfg["rivalry_window"]
+    r_start, r_end = max(1, r_start), min(last, r_end)
+    for pair in sorted(S["rivals"], key=sorted):
+        i, j = sorted(pair)
         prob += (
-            pulp.lpSum(
-                # x[i][j] means team 'i' hosts team 'j'
-                x[i][j][k]
-                for j in north_teams
-                if j != i
-                for k in rounds
-            ) >= 1,
-            f"At_Least_One_North_Home_{i}"
+            pulp.lpSum(x[i][j][k] + x[j][i][k] for k in range(r_start, r_end + 1)) == 1,
+            f"RivalryWindow_{i}_{j}",
         )
 
-    # Rule for South Teams
-    for i in south_teams:
+    # ============================================================
+    # 11. INTRA-REGIONAL HOME GAMES (paper rule 25)
+    # ============================================================
+    # Each North (South) team hosts at least one North (South) team.
+
+    for region in cfg["far_regions"]:
+        region_teams = members(region)
+        if len(region_teams) < 2:
+            continue
+        for i in region_teams:
+            prob += (
+                pulp.lpSum(x[i][j][k] for j in region_teams if j != i for k in rounds) >= 1,
+                f"IntraRegionHome_{i}",
+            )
+
+    # ============================================================
+    # 12. TOURISM (paper rule 22)
+    # ============================================================
+    # Tourist teams host at least one popular team early in the season.
+
+    early = range(1, min(cfg["tourist_rounds"], last) + 1)
+    for t in S["tourist"]:
         prob += (
-            pulp.lpSum(
-                x[i][j][k]
-                for j in south_teams
-                if j != i
-                for k in rounds
-            ) >= 1,
-            f"At_Least_One_South_Home_{i}"
+            pulp.lpSum(x[t][p][k] for p in popular if p != t for k in early) >= 1,
+            f"TouristHostsPopular_{t}",
         )
+
+    # ============================================================
+    # 13. LAST ROUND CAP (paper rule 24)
+    # ============================================================
+
+    prob += (
+        pulp.lpSum(x[i][j][last] for (i, j) in same_group_pairs) <= cfg["last_round_group_cap"],
+        "LastRoundGroupCap",
+    )
+
+    # ============================================================
+    # 14. OPTIONAL RULES, ACTIVE ONLY WHEN THE INPUT HAS THE COLUMN
+    # ============================================================
+
+    # Rule 15 (IsOutlying): popular teams do not visit outlying teams early.
+    if S["outlying"]:
+        for p in popular:
+            prob += (
+                pulp.lpSum(
+                    x[o][p][k]
+                    for o in S["outlying"] if o != p
+                    for k in range(1, min(cfg["outlying_rounds"], last) + 1)
+                ) == 0,
+                f"NoEarlyOutlyingTrip_{p}",
+            )
+
+    # Rule 18 (CrossedTeamID): crossed teams alternate home and away every round.
+    for pair in sorted(S["crossed"], key=sorted):
+        i, j = sorted(pair)
+        for k in rounds:
+            prob += home(i, k) + home(j, k) == 1, f"Crossed_{i}_{j}_{k}"
+
+    # Rule 23 (NotReadyRound1): these teams play away in round 1.
+    for t in S["not_ready"]:
+        prob += home(t, 1) == 0, f"NotReadyRound1_{t}"
 
     return prob, x
