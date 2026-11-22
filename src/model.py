@@ -26,11 +26,11 @@ DEFAULTS = {
     "rivalry_window": (4, 6),
     # Objective, part 1: weight of a game between teams of the same group, by round.
     # Rounds not listed have weight 0. These are the original weights.
-    "round_weights": {5: 1, 6: 6, 7: 15},
+    "round_weights": {5: 1, 6: 15, 7: 6},
     # Objective, part 2: a tourist team that hosts any team in these rounds earns
     # ((popularity of host + popularity of guest) / 200) x tourist_bonus_max.
     "tourist_bonus_rounds": (1, 2, 3),
-    "tourist_bonus_max": 10,
+    "tourist_bonus_max": 6,
     # Longest allowed run of home games or away games.
     "max_consecutive": 2,
     # Regions used by the North/South rules (paper rules 8, 14, 25).
